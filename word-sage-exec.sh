@@ -2,7 +2,7 @@
 # Auto-launch Wiki Browser in venv
 
 # Path to venv
-VENV_DIR="$HOME/wikibrowser-venv"
+VENV_DIR="$HOME/word-sage-venv"
 
 # Create venv if it doesn't exist
 if [ ! -d "$VENV_DIR" ]; then

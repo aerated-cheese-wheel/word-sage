@@ -15,7 +15,7 @@ from ttkbootstrap.constants import *
 BASE_ARCHIVE = "wiki_archive"
 USER_AGENT = "WordSageBot/1.0"
 SUBLINK_LIMIT = 5
-IMAGE_LIMIT = 5  # per page
+IMAGE_LIMIT = 12  # per page
 
 def log(msg):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")

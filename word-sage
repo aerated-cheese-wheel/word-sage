@@ -1,0 +1,465 @@
+# =====================
+# File: wiki_crawler.py
+# Purpose: Run-forever Wikipedia crawler that saves pages offline (HTML text + images),
+#          follows sublinks to increasingly specific topics, and respects a blocklist.
+#          Pauses/backoffs automatically on network errors or HTTP 429.
+# =====================
+
+import os
+import re
+import time
+import json
+import random
+import requests
+from collections import deque
+from urllib.parse import urljoin, unquote
+from bs4 import BeautifulSoup
+
+SAVE_ROOT = os.path.abspath(os.environ.get("WIKI_SAVE_ROOT", "wiki_data"))
+BLOCKLIST_PATH = os.path.join(SAVE_ROOT, "blocklist.json")
+USER_AGENT = (
+    "OfflineWikipediaCrawler/1.0 (+https://example.local; respectful crawler)"
+)
+HEADERS = {"User-Agent": USER_AGENT}
+
+# Broad seeds to start from (general → later we follow sublinks to get more specific)
+SEED_TOPICS = [
+    "Science", "History", "Geography", "Art", "Music", "Technology", "Medicine",
+    "Engineering", "Philosophy", "Mathematics", "Physics", "Biology", "Chemistry",
+    "Computer_science", "Psychology", "Sociology", "Economics", "Astronomy",
+    "Literature", "Culture"
+]
+
+WIKI_BASE = "https://en.wikipedia.org"
+WIKI_ARTICLE = WIKI_BASE + "/wiki/"
+RANDOM_URL = WIKI_ARTICLE + "Special:Random"
+
+# Polite crawling parameters
+REQUEST_DELAY_MIN = 1.0
+REQUEST_DELAY_MAX = 2.0
+MAX_BACKOFF = 3600  # 1 hour
+
+# Helpers
+
+def safe_filename(name: str) -> str:
+    name = unquote(name)
+    name = name.replace("/", "_")
+    return re.sub(r'[\\\\/*?:"<>|]', "_", name).strip() or "untitled"
+
+
+def ensure_dirs(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def load_blocklist() -> set:
+    if not os.path.exists(BLOCKLIST_PATH):
+        return set()
+    try:
+        with open(BLOCKLIST_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data)
+    except Exception:
+        return set()
+
+
+def save_blocklist(blocked: set):
+    ensure_dirs(SAVE_ROOT)
+    tmp = BLOCKLIST_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sorted(list(blocked)), f, ensure_ascii=False, indent=2)
+    os.replace(tmp, BLOCKLIST_PATH)
+
+
+def get(url: str):
+    """Wrapper around requests.get with headers and timeout."""
+    return requests.get(url, headers=HEADERS, timeout=20)
+
+
+def extract_title(soup: BeautifulSoup) -> str | None:
+    h1 = soup.find("h1", {"id": "firstHeading"})
+    return h1.get_text(strip=True) if h1 else None
+
+
+def extract_text(soup: BeautifulSoup) -> str:
+    # Remove junk to keep text clean
+    for e in soup(["script", "style", "table", "sup", "noscript"]):
+        e.decompose()
+    paragraphs = soup.find_all("p")
+    return "\n\n".join(p.get_text(" ", strip=True) for p in paragraphs if p.get_text(strip=True))
+
+
+def extract_sublinks(soup: BeautifulSoup) -> list[tuple[str, str]]:
+    """
+    Return list of (title, url) for internal article links only, filtering out special pages.
+    """
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("/wiki/"):
+            continue
+        # Skip non-article namespaces (Category:, File:, Help:, etc.)
+        if ":" in href.split("/wiki/")[-1]:
+            continue
+        url = urljoin(WIKI_BASE, href)
+        # Derive a title from href
+        slug = href.split("/wiki/")[-1]
+        title = safe_filename(slug.replace("_", " "))
+        if title:
+            links.append((title, url))
+    # Favor "more specific" by preferring longer titles and those with parentheses
+    links.sort(key=lambda t: ("(" in t[0], len(t[0])), reverse=True)
+    return links
+
+
+def download_images(soup: BeautifulSoup, images_dir: str) -> int:
+    ensure_dirs(images_dir)
+    count = 0
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if not src:
+            continue
+        # Build absolute URL, prefer https schemeless //
+        if src.startswith("//"):
+            img_url = "https:" + src
+        else:
+            img_url = urljoin(WIKI_BASE, src)
+        try:
+            r = requests.get(img_url, headers=HEADERS, timeout=20)
+            if r.status_code == 200 and r.content:
+                ext = os.path.splitext(src)[1].split("?")[0]
+                ext = ext if ext else ".bin"
+                fname = os.path.join(images_dir, f"image_{count}{ext}")
+                with open(fname, "wb") as f:
+                    f.write(r.content)
+                count += 1
+        except Exception:
+            continue
+    return count
+
+
+def save_page(title: str, url: str, soup: BeautifulSoup):
+    page_dir = os.path.join(SAVE_ROOT, title)
+    ensure_dirs(page_dir)
+
+    # Save raw text
+    text = extract_text(soup)
+    with open(os.path.join(page_dir, f"{title}.txt"), "w", encoding="utf-8") as f:
+        f.write(text)
+
+    # Save source URL for reference
+    with open(os.path.join(page_dir, "source_url.txt"), "w", encoding="utf-8") as f:
+        f.write(url)
+
+    # Save sublinks
+    sublinks = extract_sublinks(soup)
+    with open(os.path.join(page_dir, "sublinks.txt"), "w", encoding="utf-8") as f:
+        for t, u in sublinks:
+            f.write(f"{t}\t{u}\n")
+
+    # Save images
+    img_count = download_images(soup, os.path.join(page_dir, "images"))
+
+    return text, sublinks, img_count
+
+
+def crawl_forever():
+    ensure_dirs(SAVE_ROOT)
+    block = load_blocklist()
+
+    # Initialize queue with seeds and a few randoms
+    q = deque()
+    for topic in SEED_TOPICS:
+        q.append(WIKI_ARTICLE + topic)
+    for _ in range(5):
+        q.append(RANDOM_URL)
+
+    backoff = REQUEST_DELAY_MIN
+    pages_saved = 0
+
+    print(f"[Crawler] Saving to: {SAVE_ROOT}")
+    print("[Crawler] Loaded blocklist entries:", len(block))
+
+    while True:
+        # If queue runs dry, top up with random pages
+        if not q:
+            for _ in range(10):
+                q.append(RANDOM_URL)
+
+        url = q.popleft()
+        try:
+            # Internet health check via HEAD to reduce load
+            try:
+                requests.head(WIKI_BASE, headers=HEADERS, timeout=10)
+            except Exception:
+                # Internet likely down. Pause & retry.
+                print("[Crawler] Network issue detected. Pausing 30s...")
+                time.sleep(min(30, backoff))
+                continue
+
+            r = get(url)
+            if r.status_code == 429:
+                # Too many requests: exponential backoff
+                print(f"[Crawler] 429 rate limit. Backing off for {int(backoff)}s...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                # Requeue the same URL to retry later
+                q.append(url)
+                continue
+            elif r.status_code != 200:
+                print(f"[Crawler] HTTP {r.status_code} on {url}. Skipping.")
+                time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+                continue
+
+            # Reset backoff on success
+            backoff = REQUEST_DELAY_MIN
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            raw_title = extract_title(soup)
+            if not raw_title:
+                continue
+            title = safe_filename(raw_title)
+
+            if title in block:
+                # Already visited, but still add its sublinks to explore deeper
+                for t, u in extract_sublinks(soup)[:50]:
+                    if t not in block:
+                        q.append(u)
+                time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+                continue
+
+            text, sublinks, img_count = save_page(title, r.url, soup)
+            block.add(title)
+            save_blocklist(block)
+            pages_saved += 1
+            print(f"[Crawler] [{pages_saved}] Saved '{title}' ({len(text)} chars, {img_count} images, {len(sublinks)} links)")
+
+            # Queue sublinks to go increasingly specific
+            for t, u in sublinks[:100]:  # cap per page
+                if t not in block:
+                    q.append(u)
+
+            # Polite delay
+            time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+
+        except Exception as e:
+            print(f"[Crawler] Error: {e}. Sleeping 10s...")
+            time.sleep(10)
+            # Put URL back to try later
+            q.append(url)
+
+
+if __name__ == "__main__":
+    crawl_forever()
+
+
+# =====================
+# File: wiki_browser.py
+# Purpose: Offline Wikipedia browser with search and clickable sublinks.
+#          Reads the folder structure created by wiki_crawler.py.
+# =====================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import os
+import webbrowser
+
+DATA_ROOT = os.path.abspath(os.environ.get("WIKI_SAVE_ROOT", "wiki_data"))
+
+class OfflineWikiBrowser:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Offline Wikipedia Browser")
+        self.root.geometry("1000x700")
+
+        # Top bar
+        top = ttk.Frame(root)
+        top.pack(fill="x", pady=6)
+
+        ttk.Label(top, text="Data directory:").pack(side="left", padx=4)
+        self.dir_var = tk.StringVar(value=DATA_ROOT)
+        self.dir_entry = ttk.Entry(top, textvariable=self.dir_var, width=60)
+        self.dir_entry.pack(side="left", padx=4)
+        ttk.Button(top, text="Reload", command=self.reload_index).pack(side="left", padx=4)
+
+        ttk.Label(top, text="Search:").pack(side="left", padx=6)
+        self.query_var = tk.StringVar()
+        self.search_entry = ttk.Entry(top, textvariable=self.query_var, width=30)
+        self.search_entry.pack(side="left", padx=4)
+        ttk.Button(top, text="Go", command=self.do_search).pack(side="left", padx=4)
+
+        # Main layout: left list, right content, right sidebar for sublinks
+        main = ttk.Frame(root)
+        main.pack(fill="both", expand=True)
+
+        # Titles list
+        self.listbox = tk.Listbox(main, width=35)
+        self.listbox.pack(side="left", fill="y")
+        self.listbox.bind("<<ListboxSelect>>", self.on_select)
+
+        # Content viewer
+        center = ttk.Frame(main)
+        center.pack(side="left", fill="both", expand=True)
+
+        self.title_label = ttk.Label(center, text="", font=("TkDefaultFont", 14, "bold"))
+        self.title_label.pack(anchor="w", padx=8, pady=6)
+
+        self.text = tk.Text(center, wrap="word")
+        self.text.pack(fill="both", expand=True, padx=8, pady=6)
+
+        bottom = ttk.Frame(center)
+        bottom.pack(fill="x")
+        ttk.Button(bottom, text="Open Online", command=self.open_online).pack(side="left", padx=6, pady=4)
+        ttk.Button(bottom, text="Open Images Folder", command=self.open_images_folder).pack(side="left", padx=6)
+
+        # Sublinks sidebar
+        right = ttk.Frame(main)
+        right.pack(side="left", fill="y")
+        ttk.Label(right, text="Sublinks (click to open):").pack(anchor="w", padx=6, pady=4)
+        self.links_list = tk.Listbox(right, width=40)
+        self.links_list.pack(fill="y", padx=6)
+        self.links_list.bind("<<ListboxSelect>>", self.on_click_sublink)
+
+        # Internal state
+        self.index = []  # list of titles
+        self.title_to_dir = {}  # title -> path
+        self.current_title = None
+
+        self.reload_index()
+
+    # ---------- Index & Search ----------
+    def reload_index(self):
+        root_dir = self.dir_var.get().strip()
+        if not os.path.isdir(root_dir):
+            messagebox.showerror("Error", f"Directory not found: {root_dir}")
+            return
+        self.index.clear()
+        self.title_to_dir.clear()
+        for name in os.listdir(root_dir):
+            p = os.path.join(root_dir, name)
+            if os.path.isdir(p) and os.path.isfile(os.path.join(p, f"{name}.txt")):
+                self.index.append(name)
+                self.title_to_dir[name] = p
+        self.index.sort()
+        self.listbox.delete(0, "end")
+        for t in self.index:
+            self.listbox.insert("end", t)
+        self.text.delete("1.0", "end")
+        self.title_label.config(text="")
+        self.links_list.delete(0, "end")
+
+    def do_search(self):
+        q = self.query_var.get().strip().lower()
+        self.listbox.delete(0, "end")
+        for t in self.index:
+            if q in t.lower():
+                self.listbox.insert("end", t)
+
+    # ---------- Display ----------
+    def on_select(self, _evt=None):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        title = self.listbox.get(sel[0])
+        self.show_page(title)
+
+    def show_page(self, title: str):
+        self.current_title = title
+        page_dir = self.title_to_dir.get(title)
+        if not page_dir:
+            return
+        # Title
+        self.title_label.config(text=title)
+        # Text
+        txt_path = os.path.join(page_dir, f"{title}.txt")
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            content = "(No text content)"
+        self.text.delete("1.0", "end")
+        self.text.insert("end", content)
+        # Sublinks
+        self.links_list.delete(0, "end")
+        sub_path = os.path.join(page_dir, "sublinks.txt")
+        if os.path.isfile(sub_path):
+            with open(sub_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        t, u = line.rstrip("\n").split("\t", 1)
+                    except ValueError:
+                        continue
+                    # Mark if saved locally
+                    marker = "(saved)" if t in self.title_to_dir else "(not saved)"
+                    self.links_list.insert("end", f"{t} {marker}")
+        else:
+            self.links_list.insert("end", "(No sublinks recorded)")
+
+    def on_click_sublink(self, _evt=None):
+        sel = self.links_list.curselection()
+        if not sel:
+            return
+        item = self.links_list.get(sel[0])
+        # item format: "Title (saved)" or "Title (not saved)"
+        title = item.rsplit(" (", 1)[0]
+        if title in self.title_to_dir:
+            self.show_page(title)
+        else:
+            # Not downloaded; offer to open online
+            res = messagebox.askyesno("Not saved", f"'{title}' is not saved. Open online?")
+            if res:
+                # Find URL from current page's sublinks file
+                page_dir = self.title_to_dir.get(self.current_title)
+                if not page_dir:
+                    return
+                sub_path = os.path.join(page_dir, "sublinks.txt")
+                if os.path.isfile(sub_path):
+                    with open(sub_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            try:
+                                t, u = line.rstrip("\n").split("\t", 1)
+                            except ValueError:
+                                continue
+                            if t == title:
+                                webbrowser.open(u)
+                                break
+
+    # ---------- Utilities ----------
+    def open_online(self):
+        title = self.current_title
+        if not title:
+            return
+        page_dir = self.title_to_dir.get(title)
+        if not page_dir:
+            return
+        src = os.path.join(page_dir, "source_url.txt")
+        if os.path.isfile(src):
+            with open(src, "r", encoding="utf-8") as f:
+                url = f.read().strip()
+            if url:
+                webbrowser.open(url)
+
+    def open_images_folder(self):
+        title = self.current_title
+        if not title:
+            return
+        page_dir = self.title_to_dir.get(title)
+        if not page_dir:
+            return
+        img_dir = os.path.join(page_dir, "images")
+        if os.path.isdir(img_dir):
+            # Open folder in OS file explorer
+            if os.name == "nt":
+                os.startfile(img_dir)
+            elif os.name == "posix":
+                os.system(f'xdg-open "{img_dir}"')
+            else:
+                webbrowser.open(f"file://{img_dir}")
+        else:
+            messagebox.showinfo("Images", "No images folder for this page.")
+
+
+if __name__ == "__main__":
+    # Run the browser if this file is executed directly.
+    root = tk.Tk()
+    app = OfflineWikiBrowser(root)
+    root.mainloop()

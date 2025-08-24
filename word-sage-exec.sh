@@ -16,4 +16,4 @@ else
 fi
 
 # Run the app
-python word-sage-viewer
+python word-sage-viewer-2.2.py
